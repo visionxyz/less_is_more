@@ -224,11 +224,17 @@ def _(TinyNet, nn, torch):
             return (pred, hist) if record else pred
 
         @torch.no_grad()
-        def solve_trace(self, x_tok):
-            """Fine-grained trace: decode the answer y (and scratchpad z) after EVERY
-            inner recursion, for a smooth 'watch it crystallize' animation.
-            Returns a list of (y_grid, z_grid), length n_sup * T."""
+        def solve_trace(self, x_tok, n_reason=None, max_frames=12):
+            """Decode the answer y (and scratchpad z) after each latent recursion.
+
+            n_reason temporarily overrides how many latent-reasoning updates happen per
+            step: a SMALL value makes the model converge slowly so you can *watch* the
+            recursive refinement (at the full trained n it's essentially one-shot).
+            Stops a couple of frames after the answer stops changing."""
             self.eval()
+            orig_n = self.n
+            if n_reason is not None:
+                self.n = int(n_reason)
             x = self.embed(x_tok)
             y, z = self.init_yz(x_tok.shape[0])
 
@@ -236,13 +242,17 @@ def _(TinyNet, nn, torch):
                 lg = self.out(t).clone(); lg[..., 0] = -1e9
                 return lg.argmax(-1)
 
-            frames = []
-            for _ in range(16):                 # supervision steps (carrying y,z)
-                for _r in range(self.T):         # T recursions per step
-                    y, z = self.latent_recursion(x, y, z)
-                    frames.append((dec(y).clone(), dec(z).clone()))
-                if len(frames) >= 18:            # enough for a smooth animation
+            frames = [(dec(y).clone(), dec(z).clone())]     # frame 0 = blank/initial guess
+            _last, _stable = None, 0
+            for _ in range(24):
+                y, z = self.latent_recursion(x, y, z)
+                yp = dec(y)
+                frames.append((yp.clone(), dec(z).clone()))
+                _stable = _stable + 1 if (_last is not None and torch.equal(yp, _last)) else 0
+                _last = yp
+                if _stable >= 2 or len(frames) >= max_frames:
                     break
+            self.n = orig_n
             return frames
 
     n_params = lambda m: sum(p.numel() for p in m.parameters())
@@ -512,12 +522,16 @@ def _(mo):
         r"""
         ## 4 · 🎬 Watch the tiny network *reason* — and try it yourself
 
-        **You drive this.** Set the **difficulty** and hit **🎲 Try another puzzle** to hand
-        the model a fresh, never-seen Sudoku. Then drag the **recursion-step** slider to watch
-        it think: at every step the network rereads its own answer `y` and scratchpad `z` and
-        rewrites the grid — wrong guesses (**red**) flip to right ones (**blue**). Crank the
-        difficulty up and you can literally watch this 0.5M-parameter net reach the edge of
-        its ability.
+        **You drive this.** Pick a **difficulty**, hit **🎲 New puzzle** for a fresh unseen
+        Sudoku, then drag the **recursion-step** slider to watch it think: each step the
+        network rereads its own answer `y` and scratchpad `z` and rewrites the grid — wrong
+        guesses (**red**) flip to right ones (**blue**).
+
+        At full strength this net solves a puzzle in essentially *one* pass, too fast to watch.
+        So the **reasoning-per-step (n)** slider lets you **throttle** how much it thinks each
+        step: turn it **down** and you can watch the answer crystallize gradually; turn it
+        **up** and it snaps to the solution in fewer steps — *that* is the paper's whole thesis
+        (**more recursion → faster, better reasoning**) made tangible.
         """
     )
     return
@@ -526,13 +540,16 @@ def _(mo):
 @app.cell(hide_code=True)
 def _(mo):
     # plain-label dropdown; the label -> clue-count mapping is done explicitly below
-    # (robust: we never try to parse a number out of the label string)
     difficulty = mo.ui.dropdown(
         options=["Simple", "Medium", "Hard", "Very hard"],
         value="Simple", label="Difficulty")
+    # throttle the per-step reasoning so the solve is watchable: small n -> it fills the
+    # grid gradually over several steps; large n -> it converges almost instantly.
+    reason = mo.ui.slider(1, 6, value=2, show_value=True,
+                          label="reasoning per step  (n) — lower = watch it think slower")
     shuffle = mo.ui.run_button(label="🎲  New puzzle")
-    mo.hstack([difficulty, shuffle], justify="start", gap=2, align="center")
-    return difficulty, shuffle
+    mo.vstack([mo.hstack([difficulty, shuffle], justify="start", gap=2, align="center"), reason])
+    return difficulty, reason, shuffle
 
 
 @app.cell(hide_code=True)
@@ -545,7 +562,7 @@ def _(difficulty):
 
 
 @app.cell(hide_code=True)
-def _(SudokuData, device, model, n_clues_sel, shuffle, torch):
+def _(SudokuData, device, model, n_clues_sel, reason, shuffle, torch):
     import random
     _ = shuffle.value                         # re-run when the button is clicked
     _seed = random.randint(0, 2 ** 31 - 1)    # a different set of puzzles every time
@@ -557,7 +574,8 @@ def _(SudokuData, device, model, n_clues_sel, shuffle, torch):
         _score = (model.solve(_xb, n_sup=6) == _yb).sum(1)
         _i = int(_score.argmax().item())
         _x = _xb[_i:_i + 1]
-        _frames = model.solve_trace(_x)        # fine-grained: one frame per inner recursion
+        # throttle per-step reasoning (reason.value) so the solve unfolds gradually
+        _frames = model.solve_trace(_x, n_reason=reason.value)
     demo_puz = _x[0].cpu().numpy()
     demo_sol = _yb[_i].cpu().numpy()
     demo_steps = [(yp[0].cpu().numpy(), zp[0].cpu().numpy()) for yp, zp in _frames]
