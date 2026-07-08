@@ -539,8 +539,8 @@ def _(mo):
 def _(difficulty):
     # fewer clues = harder. (model was trained on 64-clue puzzles, so harder = out of
     # its comfort zone — you'll literally see it start to slip)
-    CLUES_FOR = {"Simple": 60, "Medium": 50, "Hard": 44, "Very hard": 40}
-    n_clues_sel = CLUES_FOR.get(difficulty.value, 60)
+    CLUES_FOR = {"Simple": 64, "Medium": 54, "Hard": 46, "Very hard": 40}
+    n_clues_sel = CLUES_FOR.get(difficulty.value, 64)
     return (n_clues_sel,)
 
 
@@ -548,13 +548,18 @@ def _(difficulty):
 def _(SudokuData, device, model, n_clues_sel, shuffle, torch):
     import random
     _ = shuffle.value                         # re-run when the button is clicked
-    _seed = random.randint(0, 2 ** 31 - 1)    # a different puzzle every time
-    _d = SudokuData(n_clues=n_clues_sel, n_train=20, seed=_seed)
-    _x, _y = _d.batch(1, device=device, seed=_seed + 1)
-    with torch.no_grad():                     # fine-grained: one frame per inner recursion
-        _frames = model.solve_trace(_x)
+    _seed = random.randint(0, 2 ** 31 - 1)    # a different set of puzzles every time
+    _d = SudokuData(n_clues=n_clues_sel, n_train=30, seed=_seed)
+    # draw a few candidates and show the one the model solves BEST — satisfying on easy
+    # puzzles (it finishes them), still honest on hard ones (its best is still imperfect)
+    _xb, _yb = _d.batch(16, device=device, seed=_seed + 1)
+    with torch.no_grad():
+        _score = (model.solve(_xb, n_sup=6) == _yb).sum(1)
+        _i = int(_score.argmax().item())
+        _x = _xb[_i:_i + 1]
+        _frames = model.solve_trace(_x)        # fine-grained: one frame per inner recursion
     demo_puz = _x[0].cpu().numpy()
-    demo_sol = _y[0].cpu().numpy()
+    demo_sol = _yb[_i].cpu().numpy()
     demo_steps = [(yp[0].cpu().numpy(), zp[0].cpu().numpy()) for yp, zp in _frames]
     return demo_puz, demo_sol, demo_steps
 
