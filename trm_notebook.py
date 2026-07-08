@@ -415,20 +415,14 @@ def _(CKPT_URL, SudokuData, TRM, device, torch, train_trm):
         return m, {"iter": h.get("eval_iter", []), "solved": h.get("solved", []),
                    "blank": h.get("blank_acc", [])}
 
-    _force_dl = os.environ.get("TRM_FORCE_EMBED", "") == "1"
-    if torch.cuda.is_available() and not _force_dl:
-        # 🚀 GPU available: train a TRM from scratch, live (~1-2 min). This is the real
-        # GPU workload — 0.49M params, batched, all on-device. Best weights auto-kept.
-        model, history = train_trm(data, iters=400, n_sup=NSUP, dim=128, log_every=40)
-        source = "trained from scratch on **GPU** just now"
+    # Always load the pre-trained weights so the demo is instant on CPU *and* GPU.
+    # (Training a fresh model on the GPU is a separate, on-demand section below.)
+    model, history = _load_pretrained()
+    if model is None:                         # fallback if the download is unreachable
+        model, history = train_trm(data, iters=300, n_sup=NSUP, dim=128, log_every=40)
+        source = "trained live (pre-trained weights were unreachable)"
     else:
-        # CPU: fetch the small pre-trained checkpoint from the repo (instant, no GPU).
-        model, history = _load_pretrained()
-        if model is None:                     # absolute last resort
-            model, history = train_trm(data, iters=200, n_sup=NSUP, dim=128, log_every=40)
-            source = "trained locally (could not fetch pre-trained weights)"
-        else:
-            source = "loaded pre-trained weights from the repo (CPU — no GPU detected)"
+        source = "loaded pre-trained weights (0.49M params, instant)"
     return N_CLUES, NSUP, data, history, model, source
 
 
@@ -440,8 +434,47 @@ def _(history, mo, model, n_params, plt, source):
     _ax.set_xlabel("training iteration"); _ax.set_ylabel("accuracy"); _ax.set_ylim(0, 1)
     _ax.legend(); _ax.grid(alpha=0.3); _ax.set_title("TRM learning to solve Sudoku")
     _cap = mo.md(f"""**Model:** {n_params(model)/1e6:.2f}M parameters · **Status:** {source}.
-    The tiny network learns to solve puzzles it has never seen:""").callout(kind="success")
+    The curve above is from training this checkpoint; you can reproduce it live below.""").callout(kind="success")
     mo.vstack([_cap, _fig])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo, torch):
+    mo.md(
+        r"""
+        ### 🚀 Reproduce it: train a fresh TRM on the **GPU**
+
+        The demo above uses pre-trained weights so it's instant. But the whole model is tiny
+        enough to train *live* — click below to train one **from random init on this GPU**
+        (~1–2 min) and watch blank-cell accuracy climb from chance to ~90 %.
+        """
+    )
+    _gpu = torch.cuda.is_available()
+    reproduce = mo.ui.run_button(
+        label="🚀 Train a fresh TRM from scratch on this GPU (~1–2 min)" if _gpu
+        else "🚀 Train from scratch  (needs a GPU — none detected)",
+        disabled=not _gpu, kind="success")
+    reproduce
+    return (reproduce,)
+
+
+@app.cell(hide_code=True)
+def _(data, mo, plt, reproduce, train_trm):
+    if not reproduce.value:
+        _out = mo.md("*👆 Click to watch a TRM learn Sudoku from scratch, live on the GPU.*")
+    else:
+        _m, _h = train_trm(data, iters=400, n_sup=6, dim=128, log_every=40)
+        _fig, _ax = plt.subplots(figsize=(6, 3.2))
+        _ax.plot(_h["iter"], _h["blank"], "-o", color="#2ca02c", label="blank-cell accuracy")
+        _ax.plot(_h["iter"], _h["solved"], "-o", color="#1f77b4", label="% fully solved")
+        _ax.set_xlabel("iteration"); _ax.set_ylabel("accuracy"); _ax.set_ylim(0, 1)
+        _ax.legend(); _ax.grid(alpha=0.3); _ax.set_title("TRM trained from scratch on this GPU")
+        _out = mo.vstack([mo.md(f"**Done.** Reached blank-cell accuracy "
+                                f"**{max(_h['blank']):.0%}** in {max(_h['iter'])+1} iterations, "
+                                f"from random initialization — all on the GPU.").callout(kind="success"),
+                          _fig])
+    _out
     return
 
 
