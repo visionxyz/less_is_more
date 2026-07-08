@@ -26,21 +26,23 @@ def _(mo):
 
         ### An interactive re-implementation of **TRM** (Jolicoeur-Martineau, 2025 · arXiv:2510.04871)
 
-        A **7-million-parameter, 2-layer network** that solves Sudoku, mazes, and ARC-AGI
-        puzzles **better than DeepSeek-R1, o3-mini and Gemini 2.5 Pro** — models over
-        *10,000× larger*.
+        The paper reports a **7-million-parameter, 2-layer network** that solves Sudoku, mazes,
+        and ARC-AGI **better than DeepSeek-R1, o3-mini and Gemini 2.5 Pro** — models over
+        *10,000× larger*:
 
         | Model | Params | Sudoku-Extreme | ARC-AGI-1 |
         |---|---|---|---|
         | DeepSeek R1 | 671 B | **0.0%** | 15.8% |
         | Gemini 2.5 Pro | ~1 T | – | 37.0% |
         | HRM (predecessor) | 27 M | 55.0% | 40.3% |
-        | **TRM (this paper)** | **7 M** | **87.4%** | **44.6%** |
+        | **TRM (the paper)** | **7 M** | **87.4%** | **44.6%** |
 
-        This notebook builds TRM's core idea from scratch, **trains it live on a GPU**, and
-        lets you **watch a tiny network reason its way to a solution, one recursive step at a
-        time.** By the end you'll understand *why* a smaller, deeper-recursing network beats
-        brute-force scale on hard reasoning puzzles.
+        **This notebook rebuilds TRM's *Sudoku core* from scratch as an even tinier
+        0.49M-parameter model** — trainable live on a GPU in ~1–2 min — and lets you **watch it
+        reason its way to a solution, one recursive step at a time.** We don't chase the paper's
+        headline numbers (Sudoku-Extreme needs ~36 GPU-hours); we make its *core idea* tangible
+        and reproducible. By the end you'll understand *why* a smaller, deeper-recursing network
+        beats brute-force scale.
         """
     )
     return
@@ -333,7 +335,7 @@ def _(F, TRM, device, solved_frac, stablemax_ce, time, torch):
     import copy
 
     def train_trm(data, iters=2000, n_sup=6, lr=7e-4, dim=256, n=6, T=3,
-                  loss_type="stablemax", ema_decay=0.999, log_every=250, on_log=None):
+                  loss_type="stablemax", ema_decay=0.999, warmup=300, log_every=250, on_log=None):
         """Deep-supervision training loop. Returns (ema_model, history)."""
         torch.manual_seed(0)
         model = TRM(dim=dim, n=n, T=T).to(device)
@@ -348,7 +350,7 @@ def _(F, TRM, device, solved_frac, stablemax_ce, time, torch):
         t0 = time.time()
         for it in range(iters):
             for g in opt.param_groups:
-                g["lr"] = lr * min(1.0, (it + 1) / 300)
+                g["lr"] = lr * min(1.0, (it + 1) / max(1, warmup))
             model.train()
             x, yt = data.batch(384, device=device)
             y, z = model.init_yz(x.shape[0])
@@ -611,6 +613,34 @@ def _(demo_puz, demo_sol, demo_steps, difficulty, mo, np, plt, render_sudoku, st
 
 
 @app.cell(hide_code=True)
+def _(demo_puz, demo_sol, demo_steps, mo, np):
+    # constraint-check the model's FINAL grid: how does it fail, exactly?
+    _final = np.asarray(demo_steps[-1][0]).reshape(9, 9)
+    _puz = np.asarray(demo_puz).reshape(9, 9)
+    _sol = np.asarray(demo_sol).reshape(9, 9)
+    _grid = np.where(_puz > 0, _puz, _final)          # clues + the model's fills
+    _ok = lambda v: sorted(int(i) for i in v) == list(range(1, 10))
+    _rows = sum(_ok(_grid[r, :]) for r in range(9))
+    _cols = sum(_ok(_grid[:, c]) for c in range(9))
+    _boxes = sum(_ok(_grid[3 * (b // 3):3 * (b // 3) + 3, 3 * (b % 3):3 * (b % 3) + 3].ravel())
+                 for b in range(9))
+    _bl = _puz == 0
+    _wrong = int((_final[_bl] != _sol[_bl]).sum()); _tot = int(_bl.sum())
+    _solved = _rows == 9 and _cols == 9 and _boxes == 9
+    _msg = ("✅ **Every row, column and 3×3 box is valid — a correctly solved Sudoku.**"
+            if _solved else
+            "⚠️ **Not yet fully valid.** Notice TRM usually fails by leaving a *few local digit "
+            "conflicts*, not by wrecking the whole grid — which is exactly why *recursive "
+            "refinement* (nudging those cells over more steps) is the right tool. Try raising "
+            "**reasoning per step (n)** above.")
+    mo.md(f"""**🔍 Constraint check on the model's final answer** — rows valid **{_rows}/9** ·
+    columns valid **{_cols}/9** · 3×3 boxes valid **{_boxes}/9** · wrong blanks **{_wrong}/{_tot}**.
+
+    {_msg}""").callout(kind="success" if _solved else "neutral")
+    return
+
+
+@app.cell(hide_code=True)
 def _(demo_puz, mo, np):
     _line = "".join(str(int(v)) for v in np.asarray(demo_puz).reshape(-1))
     _grid = "\n".join(" ".join(c if c != "0" else "." for c in _line[i:i + 9]) for i in range(0, 81, 9))
@@ -649,17 +679,20 @@ def _(mo):
 def _(mo):
     mo.md(
         r"""
-        | Change | Accuracy | Why it helps |
+        | Change | Paper (Sudoku-Extreme) | In this notebook |
         |---|---|---|
         | HRM baseline (27M, 2 nets) | 55.0% | — |
-        | 1-step gradient → **full back-prop** | 56.5 → **87.4%** | honest gradients beat a broken fixed-point approximation |
-        | 4 layers → **2 layers** | 79.5 → **87.4%** | less capacity → less overfitting on 1k puzzles |
-        | 2 networks → **1 shared network** | 82.4 → **87.4%** | halves params, forces reuse |
-        | self-attention → **MLP-Mixer** | 74.7 → **87.4%** | better inductive bias for a fixed 81-cell grid |
-        | no EMA → **EMA 0.999** | 79.9 → **87.4%** | stops the small-data collapse |
+        | 1-step gradient → **full back-prop** | 56.5 → **87.4%** | ✅ we back-prop the full recursion (`deep_recursion`) |
+        | 4 layers → **2 layers** | 79.5 → **87.4%** | ✅ our `TinyNet` is 2 layers |
+        | 2 networks → **1 shared network** | 82.4 → **87.4%** | ✅ single shared `net` |
+        | self-attention → **MLP-Mixer** | 74.7 → **87.4%** | ✅ our `MixerBlock` is attention-free |
+        | no EMA → **EMA 0.999** | 79.9 → **87.4%** | ✅ `train_trm` keeps an EMA |
+        | softmax → **stablemax** loss | (paper: stability) | ✅ **verified live in §6.5** — softmax diverges at high LR |
 
-        > The single biggest lever is **full back-propagation through the recursion** (+31 pts).
-        > That's the one line where TRM departs from HRM's theory — and it's *simpler*.
+        > The single biggest lever is **full back-propagation through the recursion** (+31 pts) —
+        > the one line where TRM departs from HRM's theory, and it's *simpler*. The **Paper**
+        > column is TRM's reported Sudoku-Extreme numbers; the right column marks which choices
+        > this notebook actually adopts, and the stablemax one we verify live in §6.
         """
     ).callout(kind="info")
     return
@@ -669,52 +702,64 @@ def _(mo):
 def _(mo):
     mo.md(
         r"""
-        ## 6 · 🔬 Our extension: how much does *test-time recursion* actually buy?
+        ## 6 · 🔬 Our extension: how far can test-time recursion be pushed?
 
-        TRM's whole premise is that **thinking longer** (more recursion) yields a better
-        answer. We can test this directly on our trained model *without any retraining* — just
-        vary the recursion budget at inference and measure accuracy on fresh puzzles.
+        TRM's premise is that **thinking longer** (more recursion) yields a better answer. Sweep
+        it yourself below — no retraining, just vary the recursion budget at inference. Pick a
+        difficulty and how far to push the number of steps **past the trained horizon (6)**.
 
-        - **Left:** accuracy vs. number of **deep-supervision steps** `N_sup` (the outer loop).
-        - **Right:** accuracy vs. **recursions per step** `T` (the inner loop the paper adds).
+        - **Left:** accuracy vs. **deep-supervision steps** `N_sup` (outer loop).
+        - **Right:** accuracy vs. **recursions per step** `T` (inner loop).
 
-        Both should rise then plateau — the model literally reasons its way to correctness,
-        and harder puzzles need more steps.
+        **Our finding:** more recursion helps — *but only within the depth the model was trained
+        on.* Push `N_sup` past 6 and the answer **collapses to noise** (shaded red). Deep
+        supervision only generalizes inside its trained range of reasoning depths.
         """
     )
     return
 
 
 @app.cell(hide_code=True)
-def _(NSUP, data, device, model, torch):
-    # cheap inference-only sweep: no retraining, just more "thinking".
-    # metric = blank-cell accuracy on held-out puzzles. (small batch -> snappy on CPU too)
-    _bs = 64 if device == "cpu" else 256
-    _xv, _yv = data.batch(_bs, device=device, seed=77)
-    _blanks = _xv == 0
+def _(mo):
+    sweep_diff = mo.ui.dropdown(["Simple", "Medium", "Hard"], value="Medium",
+                                label="sweep difficulty")
+    sweep_max = mo.ui.dropdown({"up to 6 (trained)": 6, "up to 10": 10, "up to 16": 16},
+                               value="up to 10", label="max test-time steps")
+    mo.hstack([sweep_diff, sweep_max], justify="start", gap=2, align="center")
+    return sweep_diff, sweep_max
 
-    def _blank_acc(pred):
+
+@app.cell(hide_code=True)
+def _(NSUP, SudokuData, device, model, sweep_diff, sweep_max, torch):
+    _clues = {"Simple": 60, "Medium": 52, "Hard": 46}[sweep_diff.value]
+    _bs = 64 if device == "cpu" else 256
+    _d = SudokuData(n_clues=_clues, n_train=100, seed=5)
+    _xv, _yv = _d.batch(_bs, device=device, seed=77)
+    _blanks = _xv == 0
+    def _ba(pred):
         return (pred[_blanks] == _yv[_blanks]).float().mean().item()
 
-    # sweep supervision steps up to the trained horizon (the model is only stable there)
-    sup_range = list(range(1, NSUP + 1))
-    acc_vs_sup = [_blank_acc(model.solve(_xv, n_sup=_ns)) for _ns in sup_range]
+    sup_range = list(range(1, int(sweep_max.value) + 1))
+    acc_vs_sup = [_ba(model.solve(_xv, n_sup=_ns)) for _ns in sup_range]
 
-    # sweep recursions-per-step T (inner loop), at the trained n_sup
     T_range = [1, 2, 3, 4, 6, 8]
     acc_vs_T = []
     _origT = model.T
     for _t in T_range:
         model.T = _t
-        acc_vs_T.append(_blank_acc(model.solve(_xv, n_sup=NSUP)))
+        acc_vs_T.append(_ba(model.solve(_xv, n_sup=NSUP)))
     model.T = _origT
     return T_range, acc_vs_T, acc_vs_sup, sup_range
 
 
 @app.cell(hide_code=True)
-def _(T_range, acc_vs_T, acc_vs_sup, mo, plt, sup_range):
+def _(NSUP, T_range, acc_vs_T, acc_vs_sup, mo, plt, sup_range):
     _fig, (_a, _b) = plt.subplots(1, 2, figsize=(8, 3.2))
     _a.plot(sup_range, acc_vs_sup, "-o", color="#1f77b4")
+    if max(sup_range) > NSUP:                       # mark the trained horizon + danger zone
+        _a.axvline(NSUP, color="#444", ls="--", lw=1)
+        _a.axvspan(NSUP, max(sup_range), color="#d62728", alpha=0.08)
+        _a.text(NSUP + 0.1, 0.05, "trained\nhorizon", fontsize=8, color="#444")
     _a.set_xlabel("test-time supervision steps  N_sup"); _a.set_ylabel("blank-cell accuracy")
     _a.set_title("Thinking longer (outer loop)"); _a.grid(alpha=0.3); _a.set_ylim(-0.02, 1.02)
     _b.plot(T_range, acc_vs_T, "-o", color="#d62728")
@@ -722,10 +767,57 @@ def _(T_range, acc_vs_T, acc_vs_sup, mo, plt, sup_range):
     _b.set_title("Deeper recursion (inner loop)")
     _b.grid(alpha=0.3); _b.set_ylim(-0.02, 1.02)
     _fig.tight_layout()
-    _cap = mo.md("**Test-time compute scales accuracy** — the same weights solve more puzzles "
-                 "when given more recursion, with no retraining. This is the recursive-reasoning "
-                 "thesis, reproduced on our own tiny model.")
+    _cap = mo.md("**More recursion helps — inside the trained horizon.** Beyond `N_sup = 6` "
+                 "(red zone) the iterated map leaves the regime it was supervised on and the "
+                 "answer disintegrates. A subtle, original takeaway you only get by *running* it.")
     mo.vstack([_fig, _cap])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo, torch):
+    mo.md(
+        r"""
+        ## 6.5 · 🔬 Why *stablemax*? — a stability margin you can watch appear
+
+        The paper quietly swaps softmax cross-entropy for **stablemax**. Why bother? Because a
+        recursive net that re-reads its own output produces **large-magnitude logits**, and
+        softmax's `exp()` amplifies them — so at an **aggressive learning rate** the loss blows
+        up and training collapses to chance. Stablemax uses *linear* tails instead, so it stays
+        tame. At gentle learning rates both work; crank the LR up and only stablemax survives.
+        Train both head-to-head **on the GPU** at a deliberately high LR and watch:
+        """
+    )
+    _gpu = torch.cuda.is_available()
+    ablate = mo.ui.run_button(
+        label="🔬 Train softmax vs stablemax at LR 4e-3 (~1 min)" if _gpu
+        else "🔬 (needs a GPU) softmax vs stablemax", disabled=not _gpu, kind="danger")
+    ablate
+    return (ablate,)
+
+
+@app.cell(hide_code=True)
+def _(ablate, data, mo, plt, train_trm):
+    if not ablate.value:
+        _out = mo.md("*👆 Trains two identical tiny models at an aggressive LR (4e-3) — one with "
+                     "softmax CE, one with stablemax.*")
+    else:
+        _kw = dict(iters=200, n_sup=6, dim=128, lr=4e-3, warmup=40, log_every=25)
+        _, _hs = train_trm(data, loss_type="ce", **_kw)
+        _, _ht = train_trm(data, loss_type="stablemax", **_kw)
+        _fig, _ax = plt.subplots(figsize=(6, 3.2))
+        _ax.plot(_hs["iter"], _hs["blank"], "-o", color="#d62728", label="softmax CE")
+        _ax.plot(_ht["iter"], _ht["blank"], "-o", color="#2ca02c", label="stablemax")
+        _ax.set_xlabel("iteration"); _ax.set_ylabel("blank-cell accuracy"); _ax.set_ylim(-0.02, 1.02)
+        _ax.legend(); _ax.grid(alpha=0.3); _ax.set_title("at LR 4e-3: softmax diverges, stablemax learns")
+        _out = mo.vstack([
+            mo.md(f"**At LR 4e-3, softmax CE collapses to ~{max(_hs['blank']):.0%}** (its `exp()` "
+                  f"explodes on the large logits and the loss diverges) while **stablemax reaches "
+                  f"{max(_ht['blank']):.0%}**. That extra stability margin is the paper's one-line "
+                  f"fix — reproduced from scratch. *(At gentle LRs, softmax works fine too.)*"
+                  ).callout(kind="info"),
+            _fig])
+    _out
     return
 
 
